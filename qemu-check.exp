@@ -1,0 +1,172 @@
+#!/usr/bin/expect -f
+#
+# This scripts starts QEMU, loads and boots Linux/OP-TEE, then runs
+# tests in the guest. The return code is 0 for success, >0 for error.
+#
+# Options:
+#   --bios    Path to the binary to be run [../out/bios-qemu/bios.bin]
+#   -q        Suppress output to stdout (quiet)
+#   --tests   Type of tests to run, values: all, xtest and trusted-keys
+#   --timeout Timeout for each test (sub)case, in seconds [480]
+
+set bios "../out/bios-qemu/bios.bin"
+set cmd "xtest"
+set cmd1 "cd /mnt/host/build/qemu_v8/xen"
+set cmd2 "xl create guest.cfg"
+set cmd3 "xl console domu"
+set quiet 0
+
+# The time required to run some tests (e.g., key generation tests [4007.*])
+# can be significant and vary widely -- typically, from about one minute to
+# several minutes depending on the host machine.
+# The value here should be sufficient to run the whole optee_test suite
+# ('xtest') with all testsuites enabled (regression+gp+pkcs11).
+set timeout 900
+set tests "all"
+
+# Parse command line
+set myargs $argv
+while {[llength $myargs]} {
+	set myargs [lassign $myargs arg]
+	switch -exact -- $arg {
+		"--bios"	{set myargs [lassign $myargs ::bios]}
+		"--tests"	{set myargs [lassign $myargs ::tests]}
+		"--timeout"	{set myargs [lassign $myargs ::timeout]}
+		"-q"		{set ::quiet 1}
+	}
+}
+
+proc info arg {
+	if {$::quiet==1} { return }
+	puts -nonewline $arg
+	flush stdout
+}
+
+proc check_test_result arg {
+	set casenum "none"
+	expect {
+		# Exit with error status as soon as a test fails
+		-re {  ([^ ]+) FAIL} {
+			info " $expect_out(1,string) FAIL\n"
+			exit 1
+		}
+		-re {rcu_sched detected stalls} {
+			info " Kernel error: '$expect_out(0,string)'\n"
+			exit 1
+		}
+		# Crude progress indicator: print one # when each test [sub]case starts
+		-re {([\*o]) ([^ ]+) } {
+			set casenum $expect_out(2,string)
+			if {$expect_out(1,string) == "o"} {
+				if {$star == 1} {
+					# Do not count first subcase ('o') since start
+					# of test ('*') was counted already
+					set star 0
+					exp_continue
+				}
+			} else {
+				set star 1
+			}
+			info "#"
+			incr ncases
+			if {$ncases % 50 == 0} { info "\n" }
+			exp_continue
+		}
+		# Exit when result separator is seen
+		"+-----------------------------------------------------\r\r" {}
+		# Handle errors in TEE core output
+		-i $arg -re {(assertion.*failed at.*)\n} {
+			info "!!! $expect_out(1,string)\n"
+			exit 1
+		}
+		timeout {
+			info "!!! Timeout\n"
+			info "TIMEOUT - test case too long or hung? (last test started: $casenum)\n"
+			exit 2
+		}
+	}
+	info "\nStatus: PASS ($ncases test cases)\n"
+}
+
+# Disable echoing of guest output
+log_user 0
+# Save guest console output to a file
+log_file -a -noappend "serial0.log"
+info "Starting QEMU..."
+open "serial1.log" "w+"
+spawn -open [open "|tail -f serial1.log"]
+set teecore $spawn_id
+if {[string first "aarch64" $::env(QEMU)] != -1} {
+	if {$::env(XEN_BOOT) == "y"} {
+		spawn $::env(QEMU) -nographic -serial mon:stdio -serial file:serial1.log -smp $::env(QEMU_SMP) -machine virt,secure=on,gic-version=$::env(QEMU_GIC),virtualization=true -cpu $::env(QEMU_CPU) -d unimp -semihosting-config enable=on,target=native -m $::env(QEMU_MEM) -bios bl1.bin -initrd rootfs.cpio.gz -kernel Image -no-acpi -append "console=ttyAMA0,38400 keep_bootcon root=/dev/vda2" -drive if=none,file=xen.ext4,format=raw,id=hd1 -device virtio-blk-device,drive=hd1 -fsdev local,id=fsdev0,path=../..,security_model=none -device virtio-9p-device,fsdev=fsdev0,mount_tag=host
+	} else {
+		spawn $::env(QEMU) -nographic -serial mon:stdio -serial file:serial1.log -smp $::env(QEMU_SMP) -machine virt,secure=on,gic-version=$::env(QEMU_GIC) -cpu $::env(QEMU_CPU) -d unimp -semihosting-config enable=on,target=native -m $::env(QEMU_MEM) -bios bl1.bin -initrd rootfs.cpio.gz -kernel Image -no-acpi -append "console=ttyAMA0,38400 keep_bootcon root=/dev/vda2"
+	}
+} else {
+	spawn $::env(QEMU) -nographic -monitor none -machine virt -machine secure=on -cpu cortex-a15 -smp $::env(QEMU_SMP) -d unimp -semihosting-config enable=on,target=native -m 1057 -serial stdio -serial file:serial1.log -bios $bios
+}
+expect {
+	"Kernel panic" {
+		info "!!! Kernel panic\n"
+		exit 1
+	}
+	timeout {
+		info "!!! Timeout\n"
+		exit 1
+	}
+	"ogin:"
+}
+send -- "root\r\r"
+expect "# "
+info " done, guest is booted"
+if {$::env(XEN_BOOT) == "y"} {
+        info " (Xen Dom0)"
+}
+info ".\n"
+# Toolchain libraries might be here or there
+send -- "export LD_LIBRARY_PATH=/lib:/lib/arm-linux-gnueabihf\r"
+if {$tests == "all" || $tests == "xtest"} {
+	info "Running: $cmd...\n"
+	expect "# "
+	send -- "$cmd\r"
+	check_test_result $teecore
+}
+if {$::env(XEN_BOOT) == "y"} {
+	info " Booting DomU.\n"
+	expect "# "
+	info "Running: $cmd1...\n"
+	send -- "$cmd1\r"
+	expect "# "
+	info "Running: $cmd2...\n"
+	send -- "$cmd2\r"
+	expect "# "
+	info "Running: $cmd3...\n"
+	send -- "$cmd3\r"
+	expect {
+		"Kernel panic" {
+			info "!!! Kernel panic\n"
+			exit 1
+		}
+		timeout {
+			info "!!! Timeout\n"
+			exit 1
+		}
+		"login:"
+	}
+	send -- "root\r\r"
+	expect "# "
+	info " done, DomU is booted.\n"
+	# Toolchain libraries might be here or there
+	send -- "export LD_LIBRARY_PATH=/lib:/lib/arm-linux-gnueabihf\r"
+	expect "# "
+	if {$tests == "all" || $tests == "xtest"} {
+		info "Running: $cmd...\n"
+		send -- "$cmd\r"
+		check_test_result $teecore
+	}
+}
+if {$tests == "all" || $tests == "trusted-keys"} {
+	# Invoke Trusted Keys tests
+	set basedir [file dirname $argv0]
+	source $basedir/trusted-keys.exp
+}
